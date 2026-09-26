@@ -184,18 +184,30 @@ def test_capacity_limit_rejects_second_session(client):
             assert response.status_code == 409
 
 
-def test_policy_versions_replace_previous_publication(client):
+def test_scheduled_publish_keeps_current_version_until_switch(client):
     prepared = prepare(client)
     changed = {**DEFAULT_RULES, "allocation": {**DEFAULT_RULES["allocation"], "duration_seconds": 240}}
     draft = client.post("/api/network/scenarios/gdh-rail/policies", json={"rules": changed, "actor": "tests"})
     assert draft.status_code == 201
     publish = client.post(
         f"/api/network/policies/{draft.json()['id']}/publish",
-        json={"actor": "tests", "effective_from": "2026-09-26T01:00:00Z"},
+        json={"actor": "planner", "effective_from": "2099-10-01T00:00:00Z"},
     )
     assert publish.status_code == 200
-    old = get_connection().execute("SELECT state FROM policy_versions WHERE id=?", (prepared["policy"]["id"],)).fetchone()
-    assert old["state"] == "retired"
+    old = get_connection().execute(
+        "SELECT state,retired_at,retired_by FROM policy_versions WHERE id=?",
+        (prepared["policy"]["id"],),
+    ).fetchone()
+    assert old["state"] == "published"
+    assert old["retired_at"] == "2099-10-01T00:00:00+00:00"
+    assert old["retired_by"] == "planner"
+    effective = client.get("/api/network/scenarios/gdh-rail/policies/effective")
+    assert effective.status_code == 200
+    assert effective.json()["id"] == prepared["policy"]["id"]
+    items = client.get("/api/network/scenarios/gdh-rail/policies").json()["items"]
+    lifecycle = {item["id"]: item["lifecycle"] for item in items}
+    assert lifecycle[prepared["policy"]["id"]] == "active"
+    assert lifecycle[draft.json()["id"]] == "scheduled"
 
 
 def test_demo_seed_and_summary(client):

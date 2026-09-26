@@ -54,12 +54,14 @@ CREATE TABLE IF NOT EXISTS policy_versions (
     published_by TEXT,
     effective_from TEXT,
     retired_at TEXT,
+    retired_by TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(scenario_id, version_no),
     UNIQUE(scenario_id, rules_digest)
 );
 CREATE INDEX IF NOT EXISTS idx_policy_effective ON policy_versions(scenario_id,state,effective_from);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_published_switch ON policy_versions(scenario_id,effective_from) WHERE state='published';
 CREATE TABLE IF NOT EXISTS experience_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_key TEXT NOT NULL UNIQUE,
@@ -204,3 +206,6 @@ CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(res
 
 def ensure_network_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(NETWORK_SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(policy_versions)")}
+    if "retired_by" not in columns:
+        connection.execute("ALTER TABLE policy_versions ADD COLUMN retired_by TEXT")

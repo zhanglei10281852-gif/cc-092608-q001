@@ -81,26 +81,96 @@ class NetworkAccelerationService:
             return NetworkRepository._policy(repository.policy_by_id(cursor.lastrowid))
 
     def publish_policy(self, policy_id: int, actor: str, effective_from: str) -> dict[str, Any]:
-        policy = self.repository.policy_by_id(policy_id)
-        if policy is None:
-            raise NotFoundError("策略版本不存在")
-        if policy["state"] == "retired":
-            raise ConflictError("已退役策略不能发布")
         try:
-            effective = to_storage(from_storage(effective_from))
+            requested = from_storage(effective_from)
         except ValueError as exc:
             raise ValidationError("生效时间格式不正确") from exc
-        now = to_storage(self.clock.now())
+        if requested is None:
+            raise ValidationError("生效时间格式不正确")
+        now_value = self.clock.now()
+        now = to_storage(now_value)
+        scheduled = requested > now_value
+        # 立即发布时生效时刻收敛为当前时间，保证新旧版本窗口首尾相接、互不重叠
+        effective = to_storage(requested) if scheduled else now
         with transaction(immediate=True) as connection:
-            connection.execute(
-                "UPDATE policy_versions SET state='retired',retired_at=?,updated_at=? WHERE scenario_id=? AND state='published' AND id<>?",
-                (now, now, policy["scenario_id"], policy_id),
-            )
-            connection.execute(
-                "UPDATE policy_versions SET state='published',published_by=?,effective_from=?,retired_at=NULL,updated_at=? WHERE id=?",
-                (actor, effective, now, policy_id),
-            )
-            return NetworkRepository._policy(NetworkRepository(connection).policy_by_id(policy_id))
+            repository = NetworkRepository(connection)
+            policy = repository.policy_by_id(policy_id)
+            if policy is None:
+                raise NotFoundError("策略版本不存在")
+            if policy["state"] == "retired":
+                raise ConflictError("已退役策略不能发布")
+            if policy["state"] == "published":
+                stored = policy["effective_from"]
+                if (scheduled and stored == effective) or (not scheduled and stored <= now):
+                    return NetworkRepository._policy(policy)
+                raise ConflictError("策略已发布，不能调整生效时间，请新建版本")
+            self._retire_due_policies(connection, policy["scenario_id"], now)
+            siblings = connection.execute(
+                "SELECT * FROM policy_versions WHERE scenario_id=? AND state='published' AND id<>? ORDER BY effective_from",
+                (policy["scenario_id"], policy_id),
+            ).fetchall()
+            for row in siblings:
+                window_open = row["retired_at"] is None or row["retired_at"] > effective
+                if row["effective_from"] <= now:
+                    if scheduled:
+                        # 当前版本继续服役到切换时刻，退役时间与操作人随发布一并记录
+                        if window_open:
+                            connection.execute(
+                                "UPDATE policy_versions SET retired_at=?,retired_by=?,updated_at=? WHERE id=?",
+                                (effective, actor, now, row["id"]),
+                            )
+                    else:
+                        connection.execute(
+                            "UPDATE policy_versions SET state='retired',retired_at=?,retired_by=?,updated_at=? WHERE id=?",
+                            (now, actor, now, row["id"]),
+                        )
+                elif row["effective_from"] == effective:
+                    raise ConflictError("已存在相同生效时间的待生效版本", context={"policy_id": row["id"]})
+                elif scheduled and row["effective_from"] < effective:
+                    # 排期更早的待生效版本先接管，到新版本生效时交棒
+                    if window_open:
+                        connection.execute(
+                            "UPDATE policy_versions SET retired_at=?,retired_by=?,updated_at=? WHERE id=?",
+                            (effective, actor, now, row["id"]),
+                        )
+                else:
+                    # 被取代的待生效版本从未生效，直接退役
+                    connection.execute(
+                        "UPDATE policy_versions SET state='retired',retired_at=?,retired_by=?,updated_at=? WHERE id=?",
+                        (now, actor, now, row["id"]),
+                    )
+            try:
+                connection.execute(
+                    "UPDATE policy_versions SET state='published',published_by=?,effective_from=?,retired_at=NULL,retired_by=NULL,updated_at=? WHERE id=?",
+                    (actor, effective, now, policy_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("已存在相同生效时间的待生效版本") from exc
+            return NetworkRepository._policy(repository.policy_by_id(policy_id))
+
+    def list_policies(self, scenario_code: str) -> list[dict[str, Any]]:
+        scenario = self._scenario(scenario_code)
+        now = to_storage(self.clock.now())
+        self._retire_due_policies(self.connection, scenario["id"], now)
+        return [self._with_lifecycle(policy, now) for policy in self.repository.policies(scenario["id"])]
+
+    def effective_policy_at(self, scenario_code: str, at: str | None = None) -> dict[str, Any]:
+        scenario = self._scenario(scenario_code)
+        now = to_storage(self.clock.now())
+        self._retire_due_policies(self.connection, scenario["id"], now)
+        moment = now
+        if at is not None:
+            try:
+                parsed = from_storage(at)
+            except ValueError as exc:
+                raise ValidationError("查询时间格式不正确") from exc
+            if parsed is None:
+                raise ValidationError("查询时间格式不正确")
+            moment = to_storage(parsed)
+        policy = self.repository.effective_policy(scenario["id"], moment)
+        if policy is None:
+            raise NotFoundError("该时刻没有生效的加速策略")
+        return self._with_lifecycle(NetworkRepository._policy(policy), moment)
 
     def add_entitlement(self, payload: dict[str, Any]) -> dict[str, Any]:
         scenario = self._scenario(payload["scenario_code"])
@@ -267,9 +337,31 @@ class NetworkAccelerationService:
         if app is None:
             app = self.create_application({"app_code": "video-call", "name": "视频通话", "category": "video_call", "latency_target_ms": 100, "packet_loss_target": 0.01, "min_downlink_mbps": 8, "min_uplink_mbps": 4, "default_priority": 70})
         policy = self.create_policy("gdh-rail", DEFAULT_RULES, "demo")
-        if policy["state"] != "published":
+        if policy["state"] == "draft":
             policy = self.publish_policy(policy["id"], "demo", to_storage(self.clock.now()))
         return {"scenario": scenario, "application": app, "policy": policy}
+
+    @staticmethod
+    def _retire_due_policies(connection: sqlite3.Connection, scenario_id: int, now: str) -> None:
+        # 惰性落库：切换时刻一到，旧版本在下一次访问时正式转为退役
+        connection.execute(
+            "UPDATE policy_versions SET state='retired',updated_at=? WHERE scenario_id=? AND state='published' AND retired_at IS NOT NULL AND retired_at<=?",
+            (now, scenario_id, now),
+        )
+
+    @staticmethod
+    def _with_lifecycle(policy: dict[str, Any], moment: str) -> dict[str, Any]:
+        result = dict(policy)
+        state = result["state"]
+        if state == "published":
+            if result["retired_at"] is not None and result["retired_at"] <= moment:
+                state = "retired"
+            elif result["effective_from"] is not None and result["effective_from"] > moment:
+                state = "scheduled"
+            else:
+                state = "active"
+        result["lifecycle"] = state
+        return result
 
     def _sample_result(self, sample_id: int) -> dict[str, Any]:
         sample = self.repository.sample_by_id(sample_id)

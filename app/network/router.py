@@ -44,6 +44,16 @@ def create_policy(scenario_code: str, payload: PolicyCreate):
     return service().create_policy(scenario_code, payload.rules, payload.actor)
 
 
+@router.get("/scenarios/{scenario_code}/policies")
+def list_policies(scenario_code: str):
+    return {"items": service().list_policies(scenario_code)}
+
+
+@router.get("/scenarios/{scenario_code}/policies/effective")
+def effective_policy(scenario_code: str, at: str | None = None):
+    return service().effective_policy_at(scenario_code, at)
+
+
 @router.post("/policies/{policy_id}/publish")
 def publish_policy(policy_id: int, payload: PolicyPublish):
     return service().publish_policy(policy_id, payload.actor, payload.effective_from)

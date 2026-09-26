@@ -82,10 +82,12 @@ class NetworkRepository:
         ).fetchone()
 
     def effective_policy(self, scenario_id: int, now: str) -> sqlite3.Row | None:
+        # 版本生命周期是左闭右开窗口 [effective_from, retired_at)，任意时刻最多一个版本命中
         return self.connection.execute(
-            "SELECT * FROM policy_versions WHERE scenario_id=? AND state='published' AND effective_from<=? "
+            "SELECT * FROM policy_versions WHERE scenario_id=? AND effective_from IS NOT NULL AND effective_from<=? "
+            "AND (retired_at IS NULL OR retired_at>?) "
             "ORDER BY effective_from DESC,version_no DESC LIMIT 1",
-            (scenario_id, now),
+            (scenario_id, now, now),
         ).fetchone()
 
     def policies(self, scenario_id: int) -> list[dict[str, Any]]:

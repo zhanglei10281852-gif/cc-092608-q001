@@ -52,8 +52,11 @@ CREATE TABLE IF NOT EXISTS policy_versions (
     rules_digest TEXT NOT NULL,
     created_by TEXT NOT NULL,
     published_by TEXT,
+    published_at TEXT,
     effective_from TEXT,
     retired_at TEXT,
+    retired_by TEXT,
+    is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0,1)),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(scenario_id, version_no),
@@ -204,3 +207,31 @@ CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(res
 
 def ensure_network_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(NETWORK_SCHEMA)
+    _migrate_policy_lifecycle(connection)
+
+
+def _migrate_policy_lifecycle(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(policy_versions)").fetchall()}
+    added = False
+    for column, declaration in (
+        ("published_at", "TEXT"),
+        ("retired_by", "TEXT"),
+        ("is_active", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE policy_versions ADD COLUMN {column} {declaration}")
+            added = True
+    if added:
+        connection.execute(
+            "UPDATE policy_versions SET published_at=COALESCE(published_at,created_at) "
+            "WHERE state='published' AND published_at IS NULL"
+        )
+        # 旧数据中每个场景至多只有一个 published 版本；将其标记为当前生效版本。
+        connection.execute(
+            "UPDATE policy_versions SET is_active=1 WHERE state='published' AND id IN ("
+            "SELECT MAX(id) FROM policy_versions WHERE state='published' GROUP BY scenario_id)"
+        )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_active_version "
+        "ON policy_versions(scenario_id) WHERE is_active=1"
+    )

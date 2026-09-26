@@ -83,9 +83,30 @@ class NetworkRepository:
 
     def effective_policy(self, scenario_id: int, now: str) -> sqlite3.Row | None:
         return self.connection.execute(
-            "SELECT * FROM policy_versions WHERE scenario_id=? AND state='published' AND effective_from<=? "
-            "ORDER BY effective_from DESC,version_no DESC LIMIT 1",
+            "SELECT * FROM policy_versions WHERE scenario_id=? AND state IN ('published','retired') "
+            "AND effective_from<=? ORDER BY effective_from DESC,version_no DESC,id DESC LIMIT 1",
             (scenario_id, now),
+        ).fetchone()
+
+    def due_policy_successions(self, now: str, scenario_id: int | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM policy_versions WHERE state='published' AND is_active=0 AND effective_from<=?"
+        params: list[Any] = [now]
+        if scenario_id is not None:
+            sql += " AND scenario_id=?"
+            params.append(scenario_id)
+        return self.connection.execute(sql + " ORDER BY scenario_id,effective_from,id", params).fetchall()
+
+    def active_policy(self, scenario_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM policy_versions WHERE scenario_id=? AND is_active=1",
+            (scenario_id,),
+        ).fetchone()
+
+    def latest_published_policy(self, scenario_id: int) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM policy_versions WHERE scenario_id=? AND state='published' "
+            "ORDER BY effective_from DESC,version_no DESC,id DESC LIMIT 1",
+            (scenario_id,),
         ).fetchone()
 
     def policies(self, scenario_id: int) -> list[dict[str, Any]]:

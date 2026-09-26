@@ -49,6 +49,11 @@ def publish_policy(policy_id: int, payload: PolicyPublish):
     return service().publish_policy(policy_id, payload.actor, payload.effective_from)
 
 
+@router.post("/policies/advance")
+def advance_policies(actor: str = Query(default="policy-scheduler", min_length=1)):
+    return service().activate_due_policies(actor)
+
+
 @router.post("/entitlements", status_code=201)
 def add_entitlement(payload: EntitlementCreate):
     return service().add_entitlement(payload.model_dump())

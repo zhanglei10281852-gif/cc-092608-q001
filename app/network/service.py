@@ -88,19 +88,88 @@ class NetworkAccelerationService:
             raise ConflictError("已退役策略不能发布")
         try:
             effective = to_storage(from_storage(effective_from))
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             raise ValidationError("生效时间格式不正确") from exc
         now = to_storage(self.clock.now())
+        try:
+            with transaction(immediate=True) as connection:
+                repository = NetworkRepository(connection)
+                current = repository.policy_by_id(policy_id)
+                if current["state"] == "published":
+                    if current["effective_from"] != effective or current["published_by"] != actor:
+                        raise ConflictError("策略已发布，不能修改生效时间或发布人")
+                    self._reconcile_policies(connection, now, scenario_id=current["scenario_id"])
+                    return NetworkRepository._policy(repository.policy_by_id(policy_id))
+                latest = repository.latest_published_policy(current["scenario_id"])
+                if latest is not None and latest["effective_from"] >= effective:
+                    raise ConflictError("新生效时间必须晚于当前已发布版本的生效时间")
+                connection.execute(
+                    "UPDATE policy_versions SET state='published',published_by=?,published_at=?,effective_from=?,"
+                    "retired_at=NULL,retired_by=NULL,updated_at=? WHERE id=?",
+                    (actor, now, effective, now, policy_id),
+                )
+                self._policy_event(connection, current["scenario_id"], policy_id, "published", actor, {"effective_from": effective, "version_no": current["version_no"]}, now)
+                self._reconcile_policies(connection, now, scenario_id=current["scenario_id"])
+                return NetworkRepository._policy(repository.policy_by_id(policy_id))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("策略发布冲突：同一时刻已有其他版本生效") from exc
+
+    def activate_due_policies(self, actor: str = "policy-scheduler") -> dict[str, Any]:
+        now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
+            activated, retired = self._reconcile_policies(connection, now, actor)
+        return {"activated": activated, "retired": retired}
+
+    def _reconcile_at(self, now: str) -> None:
+        if self.repository.due_policy_successions(now):
+            with transaction(immediate=True) as connection:
+                self._reconcile_policies(connection, now)
+
+    @staticmethod
+    def _reconcile_policies(
+        connection: sqlite3.Connection,
+        now: str,
+        actor: str | None = None,
+        scenario_id: int | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        repository = NetworkRepository(connection)
+        activated: list[dict[str, Any]] = []
+        retired: list[dict[str, Any]] = []
+        for successor in repository.due_policy_successions(now, scenario_id):
+            sid = successor["scenario_id"]
+            current = repository.active_policy(sid)
+            if current is not None and (
+                int(current["id"]) == int(successor["id"]) or current["effective_from"] >= successor["effective_from"]
+            ):
+                continue
+            predecessors = connection.execute(
+                "SELECT id,version_no FROM policy_versions WHERE scenario_id=? AND is_active=1 AND id<>?",
+                (sid, successor["id"]),
+            ).fetchall()
+            boundary = successor["effective_from"]
+            operator = actor or successor["published_by"]
             connection.execute(
-                "UPDATE policy_versions SET state='retired',retired_at=?,updated_at=? WHERE scenario_id=? AND state='published' AND id<>?",
-                (now, now, policy["scenario_id"], policy_id),
+                "UPDATE policy_versions SET is_active=0,state='retired',retired_at=?,retired_by=COALESCE(retired_by,?),updated_at=? "
+                "WHERE scenario_id=? AND is_active=1 AND id<>?",
+                (boundary, successor["published_by"], boundary, sid, successor["id"]),
             )
             connection.execute(
-                "UPDATE policy_versions SET state='published',published_by=?,effective_from=?,retired_at=NULL,updated_at=? WHERE id=?",
-                (actor, effective, now, policy_id),
+                "UPDATE policy_versions SET is_active=1,state='published',updated_at=? WHERE id=? AND state='published'",
+                (boundary, successor["id"]),
             )
-            return NetworkRepository._policy(NetworkRepository(connection).policy_by_id(policy_id))
+            for predecessor in predecessors:
+                retired.append({"id": int(predecessor["id"]), "version_no": int(predecessor["version_no"]), "retired_at": boundary, "retired_by": successor["published_by"]})
+                NetworkAccelerationService._policy_event(connection, sid, predecessor["id"], "retired", operator, {"successor_version_no": successor["version_no"], "retired_at": boundary}, boundary)
+            activated.append({"id": int(successor["id"]), "version_no": int(successor["version_no"]), "effective_from": boundary})
+            NetworkAccelerationService._policy_event(connection, sid, successor["id"], "activated", operator, {"effective_from": boundary}, boundary)
+        return activated, retired
+
+    @staticmethod
+    def _policy_event(connection: sqlite3.Connection, scenario_id: int, policy_id: int, event_type: str, actor: str, detail: dict[str, Any], now: str) -> None:
+        connection.execute(
+            "INSERT INTO operation_events(resource_type,resource_id,event_type,actor,detail_json,created_at) VALUES(?,?,?,?,?,?)",
+            ("policy", policy_id, event_type, actor, json.dumps(detail, ensure_ascii=False, sort_keys=True), now),
+        )
 
     def add_entitlement(self, payload: dict[str, Any]) -> dict[str, Any]:
         scenario = self._scenario(payload["scenario_code"])
@@ -141,6 +210,7 @@ class NetworkAccelerationService:
                 raise ConflictError("相同 sample_key 对应了不同观测内容")
             return self._sample_result(existing["id"])
         now = to_storage(self.clock.now())
+        self._reconcile_at(now)
         policy = self.repository.effective_policy(scenario["id"], now)
         rules = json.loads(policy["rules_json"]) if policy else DEFAULT_RULES
         decision = judge_quality(payload, dict(app), rules)
@@ -180,6 +250,7 @@ class NetworkAccelerationService:
         entitlement = self.repository.active_entitlement(sample["subscriber_hash"], incident["scenario_id"], now)
         if entitlement is None:
             raise ConflictError("用户没有当前场景的有效加速权益")
+        self._reconcile_at(now)
         policy = self.repository.effective_policy(incident["scenario_id"], now)
         if policy is None:
             raise ConflictError("场景没有已生效的加速策略")

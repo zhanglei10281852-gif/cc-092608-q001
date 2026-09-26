@@ -184,18 +184,31 @@ def test_capacity_limit_rejects_second_session(client):
             assert response.status_code == 409
 
 
-def test_policy_versions_replace_previous_publication(client):
+def test_policy_versions_keep_previous_active_until_effective_time(client):
     prepared = prepare(client)
     changed = {**DEFAULT_RULES, "allocation": {**DEFAULT_RULES["allocation"], "duration_seconds": 240}}
     draft = client.post("/api/network/scenarios/gdh-rail/policies", json={"rules": changed, "actor": "tests"})
     assert draft.status_code == 201
     publish = client.post(
         f"/api/network/policies/{draft.json()['id']}/publish",
-        json={"actor": "tests", "effective_from": "2026-09-26T01:00:00Z"},
+        json={"actor": "tests", "effective_from": "2026-10-01T00:00:00Z"},
     )
     assert publish.status_code == 200
-    old = get_connection().execute("SELECT state FROM policy_versions WHERE id=?", (prepared["policy"]["id"],)).fetchone()
-    assert old["state"] == "retired"
+    future = dict(get_connection().execute("SELECT * FROM policy_versions WHERE id=?", (draft.json()["id"],)).fetchone())
+    old = dict(get_connection().execute("SELECT * FROM policy_versions WHERE id=?", (prepared["policy"]["id"],)).fetchone())
+    assert future["state"] == "published"
+    assert future["is_active"] == 0
+    # 未来版本保持已发布待生效，当前版本继续生效
+    assert old["state"] == "published"
+    assert old["is_active"] == 1
+    assert old["retired_at"] is None
+    # 重复发布是幂等的，不产生新版本切换
+    repeat = client.post(
+        f"/api/network/policies/{draft.json()['id']}/publish",
+        json={"actor": "tests", "effective_from": "2026-10-01T00:00:00Z"},
+    )
+    assert repeat.status_code == 200
+    assert get_connection().execute("SELECT COUNT(*) FROM policy_versions WHERE scenario_id=1 AND is_active=1").fetchone()[0] == 1
 
 
 def test_demo_seed_and_summary(client):
